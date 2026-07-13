@@ -1,7 +1,10 @@
+import json
 import logging
 import os
 import sys
+from datetime import datetime
 
+import pandas as pd
 import pymysql
 import redis
 from dotenv import load_dotenv
@@ -92,6 +95,28 @@ def get_mysql_connection():
     return mysql_connection
 
 
+def get_terminals_df():
+    try:
+        db_connection = get_mysql_connection()
+        with db_connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    tid,
+                    hardware_model,
+                    hardware_family,
+                    enabled,
+                    last_call_stamp
+                FROM terminals
+                """
+            )
+            terminals = cursor.fetchall()
+
+        return pd.DataFrame(terminals)
+    except pymysql.MySQLError as error:
+        raise error
+
+
 def initialize_mysql():
     global mysql_connection
 
@@ -115,6 +140,13 @@ def initialize_redis():
         logger.info("Redis connection initialized")
     except Exception:
         logger.exception("Redis connection failed during startup")
+
+
+def clear_terminals_cache():
+    try:
+        redis_client.flushdb()
+    except Exception:
+        logger.warning("Redis is down, couldn't clear cache")
 
 
 def check_mysql():
@@ -174,9 +206,100 @@ def health():
     )
 
 
+@app.get("/stats/by-hardware")
+def stats_by_hardware():
+    try:
+        terminals_df = get_terminals_df()
+        terminals_df["hardware_model"] = terminals_df["hardware_model"].fillna(
+            "Unknown"
+        )
+        hardware_counts = terminals_df.groupby("hardware_model").size().to_dict()
+        return jsonify(hardware_counts)
+    except Exception:
+        logger.exception("Error while calculating hardware statistics")
+        return jsonify({"error": "Internal server error"}), 500
+
+
+@app.get("/stats/by-hardware-family")
+def stats_by_hardware_family():
+    try:
+        terminals_df = get_terminals_df()
+        terminals_df["hardware_family"] = terminals_df["hardware_family"].fillna(
+            "Unknown"
+        )
+        family_counts = terminals_df.groupby("hardware_family").size().to_dict()
+        return jsonify(family_counts)
+    except Exception:
+        logger.exception("Error while calculating hardware family statistics")
+        return jsonify({"error": "Internal server error"}), 500
+
+
+@app.get("/stats/by-state")
+def stats_by_state():
+    try:
+        terminals_df = get_terminals_df()
+        terminals_df["state"] = (
+            terminals_df["enabled"]
+            .map({1: "Active", 0: "Inactive"})
+            .fillna("Unknown")
+        )
+        state_counts = terminals_df.groupby("state").size().to_dict()
+        return jsonify(state_counts)
+    except Exception:
+        logger.exception("Error while calculating terminal state statistics")
+        return jsonify({"error": "Internal server error"}), 500
+
+
+@app.get("/stats/idle-distribution")
+def stats_idle_distribution():
+    try:
+        terminals_df = get_terminals_df()
+        last_calls = pd.to_datetime(terminals_df["last_call_stamp"], errors="coerce")
+        idle_hours = (datetime.now() - last_calls).dt.total_seconds() / 3600
+        categories = ["0-24h", "1-7 days", "7+ days", "Never"]
+
+        terminals_df["idle_category"] = "Never"
+        has_called = idle_hours.notna()
+        terminals_df.loc[has_called, "idle_category"] = pd.cut(
+            idle_hours[has_called],
+            bins=[-float("inf"), 24, 168, float("inf")],
+            labels=categories[:3],
+            include_lowest=True,
+        ).astype("string")
+
+        idle_counts = (
+            terminals_df.groupby("idle_category")
+            .size()
+            .reindex(categories, fill_value=0)
+            .to_dict()
+        )
+        return jsonify(idle_counts)
+    except Exception:
+        logger.exception("Error while calculating idle distribution statistics")
+        return jsonify({"error": "Internal server error"}), 500
+
+
 @app.get("/terminals")
 def list_terminals():
     enabled = request.args.get("enabled")
+    enabled_value = None
+
+    if enabled is not None:
+        enabled_value = enabled.lower()
+        if enabled_value not in ("true", "false"):
+            return jsonify({"error": "enabled must be true or false"}), 400
+
+    cache_key = f"cache_terminals_{enabled_value}"
+
+    try:
+        cached_terminals = redis_client.get(cache_key)
+        if cached_terminals is not None:
+            logger.info("Cache HIT")
+            return jsonify(json.loads(cached_terminals))
+    except Exception:
+        logger.warning("Redis is down, couldn't read cache")
+
+    logger.info("Cache MISS")
     query = """
         SELECT
             t.tid,
@@ -190,11 +313,7 @@ def list_terminals():
     """
     params = ()
 
-    if enabled is not None:
-        enabled_value = enabled.lower()
-        if enabled_value not in ("true", "false"):
-            return jsonify({"error": "enabled must be true or false"}), 400
-
+    if enabled_value is not None:
         query += " WHERE t.enabled = %s"
         params = (1 if enabled_value == "true" else 0,)
 
@@ -205,6 +324,12 @@ def list_terminals():
         with db_connection.cursor() as cursor:
             cursor.execute(query, params)
             terminals = cursor.fetchall()
+
+        try:
+            json_data = json.dumps(terminals, default=str)
+            redis_client.setex(cache_key, 30, json_data)
+        except Exception:
+            logger.warning("Redis is down, couldn't write cache")
 
         return jsonify(terminals)
     except pymysql.MySQLError:
@@ -392,6 +517,7 @@ def create_terminal_from_template():
             template_id,
             mid,
         )
+        clear_terminals_cache()
         return jsonify({"message": "Terminal created", "tid": new_tid}), 201
     except pymysql.MySQLError:
         if db_connection is not None:
@@ -469,6 +595,7 @@ def flag_terminal(tid):
         logger.info(
             "Flagged terminal %s with scenario_number %s", tid, scenario_number
         )
+        clear_terminals_cache()
         return jsonify(
             {
                 "message": "Terminal flagged",
@@ -503,6 +630,7 @@ def unflag_terminal(tid):
 
         db_connection.commit()
         logger.info("Unflagged terminal %s", tid)
+        clear_terminals_cache()
         return jsonify({"message": "Terminal unflagged", "tid": tid})
     except pymysql.MySQLError:
         if "db_connection" in locals():
@@ -545,6 +673,7 @@ def decommission_terminal(tid):
 
         db_connection.commit()
         logger.info("Decommissioned terminal %s", tid)
+        clear_terminals_cache()
         return jsonify({"message": "Terminal decommissioned", "tid": tid})
     except pymysql.MySQLError:
         if "db_connection" in locals():
