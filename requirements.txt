@@ -1,0 +1,5 @@
+Flask
+PyMySQL
+redis
+pandas
+python-dotenv
