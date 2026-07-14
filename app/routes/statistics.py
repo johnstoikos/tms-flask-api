@@ -8,7 +8,7 @@ import pandas as pd
 from flask import Blueprint, jsonify
 
 from cache import redis_client
-from config import logger
+from settings import logger
 from database import get_terminals_df
 
 

@@ -1,46 +1,75 @@
 services:
   mysql:
     image: mysql:8.4
-    container_name: final_assignment-mysql-1
+    container_name: tms-mysql
     environment:
-      MYSQL_ROOT_PASSWORD: root
-      MYSQL_DATABASE: tms_db
-      MYSQL_USER: tms_user
-      MYSQL_PASSWORD: tms_password
+      # Διαβάζει τα credentials από το .env αρχείο
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-tms_db}
+      MYSQL_USER: ${MYSQL_USER:-tms_user}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-tms_password}
     ports:
       - "3307:3306"
     volumes:
       - mysql_data:/var/lib/mysql
+      # Αυτόματο seed κατά το πρώτο σήκωμα της βάσης
       - ./db/init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u$$MYSQL_USER", "-p$$MYSQL_PASSWORD"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
     networks:
       - tms_network
 
   redis:
     image: redis:7.2-alpine
-    container_name: final_assignment-redis-1
+    container_name: tms-redis
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
     networks:
       - tms_network
 
-  web:
-    build: .
-    container_name: tms_api
+  tms-api:
+    build: ./app
+    container_name: tms-api
     ports:
       - "5001:5000"
     environment:
       - MYSQL_HOST=mysql
       - MYSQL_PORT=3306
-      - MYSQL_USER=tms_user
-      - MYSQL_PASSWORD=tms_password
-      - MYSQL_DATABASE=tms_db
+      - MYSQL_USER=${MYSQL_USER:-tms_user}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-tms_password}
+      - MYSQL_DATABASE=${MYSQL_DATABASE:-tms_db}
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - FLASK_HOST=0.0.0.0
       - FLASK_PORT=5000
     depends_on:
-      - mysql
-      - redis
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - tms_network
+
+  cron-cleanup:
+    build: ./cron
+    container_name: tms-cron-cleanup
+    environment:
+      - MYSQL_HOST=mysql
+      - MYSQL_PORT=3306
+      - MYSQL_USER=${MYSQL_USER:-tms_user}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-tms_password}
+      - MYSQL_DATABASE=${MYSQL_DATABASE:-tms_db}
+    depends_on:
+      mysql:
+        condition: service_healthy
     networks:
       - tms_network
 
