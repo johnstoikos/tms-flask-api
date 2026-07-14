@@ -3,3 +3,4 @@ PyMySQL
 redis
 pandas
 python-dotenv
+pytest==8.2.2
