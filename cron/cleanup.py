@@ -3,7 +3,7 @@ import sys
 import pymysql
 
 def main():
-    # Λήψη ρυθμίσεων σύνδεσης από το περιβάλλον
+    # Λήψη των ρυθμίσεων σύνδεσης από τις μεταβλητές περιβάλλοντος του Cron container
     host = os.getenv("MYSQL_HOST", "mysql")
     port = int(os.getenv("MYSQL_PORT", "3306"))
     user = os.getenv("MYSQL_USER", "tms_user")
@@ -27,7 +27,7 @@ def main():
 
     try:
         with connection.cursor() as cursor:
-            # 1. Εύρεση των TIDs που έχουν λήξει (delete_after < NOW())
+            # Ανάκτηση των TIDs που έχουν ξεπεράσει την ημερομηνία διαγραφής (delete_after < NOW())
             cursor.execute(
                 "SELECT tid FROM decommission_queue WHERE delete_after < NOW()"
             )
@@ -40,27 +40,31 @@ def main():
             expired_tids = [row["tid"] for row in expired_records]
             print(f"Cron Job: Found {len(expired_tids)} expired terminals: {expired_tids}", flush=True)
 
-            # Ξεκινάμε transaction
+            # Έναρξη χειροκίνητης συναλλαγής (Transaction) για εγγύηση της ατομικότητας (All-or-Nothing execution)
             connection.begin()
 
-            # 2. Διαγραφή ΠΡΩΤΑ από το decommission_queue για αποφυγή FK constraint error
+            # Δυναμικό χτίσιμο των safe query placeholders (%s, %s, ...) για την αποφυγή SQL Injection
             format_strings = ','.join(['%s'] * len(expired_tids))
+            
+            # Βήμα 1: Απαλοιφή των εγγραφών από το decommission_queue (Child Table) 
+            # για την αποφυγή Foreign Key constraint violation κατά τη διαγραφή
             cursor.execute(
                 f"DELETE FROM decommission_queue WHERE tid IN ({format_strings})",
                 tuple(expired_tids)
             )
 
-            # 3. Διαγραφή ΜΕΤΑ από τον πίνακα terminals
+            # Βήμα 2: Οριστική διαγραφή από τον πίνακα terminals (Parent Table)
             cursor.execute(
                 f"DELETE FROM terminals WHERE tid IN ({format_strings})",
                 tuple(expired_tids)
             )
 
-            # Commit της συναλλαγής
+            # Οριστικοποίηση των αλλαγών στη βάση
             connection.commit()
             print(f"Cron Job SUCCESS: Deleted {len(expired_tids)} terminals from queue and terminals table.", flush=True)
 
     except Exception as e:
+        # Αν προκύψει οποιοδήποτε σφάλμα, ακυρώνονται όλες οι ενδιάμεσες αλλαγές για την προστασία της ακεραιότητας των δεδομένων
         connection.rollback()
         print(f"Cron Job TRANSACTION FAILED: Rolling back. Error: {e}", file=sys.stderr, flush=True)
     finally:
